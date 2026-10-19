@@ -135,6 +135,9 @@ class TtPrefillRuntime:
     # write a KV slab and its residual is block-structured, so it cannot reuse the shared block. A
     # class attribute rather than a constructor argument, so every existing caller is unaffected.
     MODEL_CLS = TtPrefillTransformer
+    # The D2D payload dim the DFlash drafter partial is packed on beside the hidden: 3 widens it to 2H,
+    # 1 adds one plane. The runner sizes the socket from this.
+    DFLASH_PARTIAL_DIM = 3
 
     def __init__(
         self,
@@ -474,19 +477,24 @@ class TtPrefillRuntime:
 
     def _pack_activation(self, hidden: ttnn.Tensor, partial: ttnn.Tensor) -> ttnn.Tensor:
         """Fuse this rank's output hidden and finalized drafter FC partial into ONE activation for the D2D
-        handoff — per-chip ``[1,1,chunk/sp,H/tp]`` → ``[1,1,chunk/sp,2H/tp]`` (the runner widens the D2D
-        activation spec to 2H when dflash is on). Consumes both inputs; only a non-last rank packs."""
-        packed = ttnn.concat([hidden, partial], dim=3)
+        handoff, on ``DFLASH_PARTIAL_DIM``: per-chip ``[1,1,chunk/sp,H/tp]`` → ``[1,1,chunk/sp,2H/tp]`` on
+        dim 3, or one more plane on dim 1 (the runner sizes the D2D spec to match). Consumes both inputs;
+        only a non-last rank packs."""
+        packed = ttnn.concat([hidden, partial], dim=self.DFLASH_PARTIAL_DIM)
         ttnn.deallocate(hidden)
         ttnn.deallocate(partial)
         return packed
 
     def _unpack_activation(self, packed: ttnn.Tensor) -> Tuple[ttnn.Tensor, ttnn.Tensor]:
-        """Inverse of :meth:`_pack_activation`: split the received per-chip ``[1,1,chunk/sp,2H/tp]`` into the
-        hidden fed to the verifier and the drafter partial imported into the drafter (each
-        ``[1,1,chunk/sp,H/tp]``). Only a non-first rank unpacks."""
-        half = packed.shape[-1] // 2
+        """Inverse of :meth:`_pack_activation`: split the received activation into the hidden fed to the
+        verifier and the drafter partial ``[1,1,chunk/sp,H/tp]`` imported into the drafter. Only a non-first
+        rank unpacks."""
         s0, s1, s2, s3 = packed.shape
+        if self.DFLASH_PARTIAL_DIM == 1:
+            hidden = ttnn.slice(packed, [0, 0, 0, 0], [s0, s1 - 1, s2, s3])
+            partial = ttnn.slice(packed, [0, s1 - 1, 0, 0], [s0, s1, s2, s3])
+            return hidden, partial
+        half = s3 // 2
         hidden = ttnn.slice(packed, [0, 0, 0, 0], [s0, s1, s2, half])
         partial = ttnn.slice(packed, [0, 0, 0, half], [s0, s1, s2, s3])
         return hidden, partial
@@ -556,13 +564,15 @@ class TtPrefillRuntime:
         ttnn.deallocate(ids_block)
         return union, hidden, None
 
-    def make_placeholder_activation(self, dflash_packed: bool = True) -> ttnn.Tensor:
+    def make_placeholder_activation(self, dflash_packed: bool = True, planes: Optional[int] = None) -> ttnn.Tensor:
         """Allocate a zero activation matching what the D2D socket delivers, per chip.
 
         Stand-in input for a non-first rank until the upstream sync op overwrites it in place. Both
-        packed forms are sized here -- DFlash widens, MTP heightens -- and `_prepare_trace` captures it.
+        packed forms are sized here -- DFlash widens or adds a plane, MTP heightens -- and
+        `_prepare_trace` captures it.
 
-        ``dflash_packed=False`` asks for the hidden-only width under DFlash, which the traced path needs.
+        ``dflash_packed=False`` asks for the hidden alone under DFlash, which the traced path needs;
+        ``planes`` overrides the plane count (the drafter partial is one plane).
         """
         rows = (
             d2d_activation_rows(
@@ -570,10 +580,13 @@ class TtPrefillRuntime:
             )
             // self.config.sp_factor
         )
+        dflash = self.config.dflash_enabled and dflash_packed
         emb_per_tp = d2d_activation_width(
-            self.hf_config.hidden_size, dflash=(self.config.dflash_enabled and dflash_packed)
+            self.hf_config.hidden_size, dflash=dflash and self.DFLASH_PARTIAL_DIM == 3
         ) // (self.config.tp_factor)
-        zeros = torch.zeros(1, self.activation_planes, rows, emb_per_tp, dtype=torch.bfloat16)
+        if planes is None:
+            planes = self.activation_planes + int(dflash and self.DFLASH_PARTIAL_DIM == 1)
+        zeros = torch.zeros(1, planes, rows, emb_per_tp, dtype=torch.bfloat16)
         return ttnn.from_torch(
             zeros,
             device=self.mesh_device,
@@ -966,8 +979,8 @@ class TtPrefillRuntime:
         chunk = self.config.chunk_size
         if self.config.dflash_enabled and not self.config.is_first_rank:
             self._trace_input = self.make_placeholder_activation(dflash_packed=False)
-            # The capture reads the upstream partial here; same shape as the hidden half.
-            self._trace_partial_in = self.make_placeholder_activation(dflash_packed=False)
+            # The capture reads the upstream partial here; one plane of the hidden's width.
+            self._trace_partial_in = self.make_placeholder_activation(dflash_packed=False, planes=1)
         else:
             self._trace_input = self.make_chunk_input([0] * chunk)
         if self.config.mtp_levels and self.config.is_first_rank:
