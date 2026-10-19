@@ -31,6 +31,8 @@ from models.demos.deepseek_v3_d_p.tt.tt_prefill_runtime import TtPrefillRuntime
 
 class TtKimiK3Runtime(TtPrefillRuntime):
     MODEL_CLS = TtKimiK3Transformer
+    # The payload is already [1, planes, rows, H]; widening to 2H would double every sealed plane too.
+    DFLASH_PARTIAL_DIM = 1
 
     def _build_model(self, state_dict: dict) -> None:
         # The shared build starts GLM-5.3's MTP predictor before MODEL_CLS runs, so reject here.
@@ -48,6 +50,10 @@ class TtKimiK3Runtime(TtPrefillRuntime):
         same boundary and disagreeing shows up as a rendezvous failure, not a wrong answer.
         """
         return 1 + self.config.first_layer_idx // KimiK3Config.ATTN_RES_BLOCK_SIZE
+
+    def _dflash_tap_layer(self, target_layer_idx: int) -> int:
+        """DSpark taps target t at layer t+1's attention input, so tap 23 belongs to the rank starting at 24."""
+        return target_layer_idx + 1
 
     def _my_mla_layer_ids(self):
         """The GLOBAL model layers in this rank's slice that own a KV slab."""
@@ -87,7 +93,8 @@ class TtKimiK3Runtime(TtPrefillRuntime):
         carries.bind_slabs(slabs)
 
     def kv_migration_stages(self, kv_caches, first_layer_idx=None, num_my_layers=None):
-        """Three stages, always, in table-config order: kvpe, KDA recurrent, KDA convolution.
+        """Three stages, always, in table-config order: kvpe, KDA recurrent, KDA convolution. Under DSpark
+        the drafter's K and V follow, as in the shared runtime.
 
         Kimi-K3 writes a KV slab on 24 of its 93 layers, so a 12-layer rank owns 3. The shared
         implementation reports the rank's LAYER span, which disagrees with the cache it describes
@@ -113,9 +120,6 @@ class TtKimiK3Runtime(TtPrefillRuntime):
 
         if kv_caches.index is not None:
             raise RuntimeError("Kimi-K3 has no DSA index cache; a merged table here is unexpected")
-        if self.config.dflash_enabled:
-            raise RuntimeError("Kimi-K3 declares its own three migration stages; DFlash stages are not supported")
-
         # An empty stage still sits at this rank's slot offset: the merged table requires the gathered
         # stages to tile [0, total), and one at 0 would break that on any later rank.
         null_kda = KvCacheStage(0, first_kda, 0)
@@ -139,7 +143,7 @@ class TtKimiK3Runtime(TtPrefillRuntime):
         if kda is None:
             if my_kda:
                 raise RuntimeError(f"no KDA state slabs allocated but layers {my_kda} are KDA layers")
-            return [kvpe_stage, null_kda, null_kda]
+            return [kvpe_stage, null_kda, null_kda, *self._dflash_stages(first_slot + len(my_slots))]
         if tuple(kda.layer_ids) != tuple(my_kda):
             raise RuntimeError(f"KDA slabs cover layers {kda.layer_ids} but this stage owns {my_kda}")
         if kda.num_slots != self.config.num_users:
@@ -148,7 +152,13 @@ class TtKimiK3Runtime(TtPrefillRuntime):
             kvpe_stage,
             KvCacheStage(int(kda.recurrent.buffer_address()), first_kda, len(my_kda)),
             KvCacheStage(int(kda.convolution.buffer_address()), first_kda, len(my_kda)),
+            *self._dflash_stages(first_slot + len(my_slots)),
         ]
+
+    def _dflash_stages(self, end_slot: int):
+        """The drafter's layers continue the ACK axis, i.e. the compacted MLA slots (24 on the tail), not
+        the model's 93: the producer counts a chunk's acks off the drafter config's extent."""
+        return self._dflash_migration_stages(end_slot) if self.config.dflash_enabled else []
 
     def kv_table_layer_rows(self, stage_layouts):
         """Publish slab i at its model layer, so table rows stay on the layer axis.
@@ -206,6 +216,7 @@ class TtKimiK3Runtime(TtPrefillRuntime):
                 )
                 for stage in self.kv_migration_stages(kv_caches, first_layer_idx, num_my_layers)
             ]
+        stage_layouts, dflash_table = self._dflash_table_args(stage_layouts, 3)
         if len(stage_layouts) != 3:
             raise RuntimeError(
                 f"Kimi-K3 declares three migration stages (kvpe, KDA recurrent, KDA convolution) but "
@@ -257,6 +268,7 @@ class TtKimiK3Runtime(TtPrefillRuntime):
             stage_layouts=[kvpe_layout],
             layer_rows=self.kv_table_layer_rows([kvpe_layout]),
             kda=kda,
+            **dflash_table,
         )
 
     def warmup_ack_count(self) -> int:
@@ -271,7 +283,7 @@ class TtKimiK3Runtime(TtPrefillRuntime):
         """
         if not self.config.use_trace or self._trace_d2h_service is None:
             return 0
-        return len(self._my_mla_layer_ids())
+        return self.layer_ack_layers(0, len(self._my_mla_layer_ids()))[1]
 
     def prefill_chunk(self, *args, **kwargs):
         """Reset the KDA carries at the start of a request, then defer to the shared runtime.
