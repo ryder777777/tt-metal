@@ -90,6 +90,7 @@ env:
     llk_e2e_tests.yaml
     llk_bit_exact_tests.yaml
     llk_perf_tests.yaml
+    llk_sfpu_report_tests.yaml
 
   # Yamls under tests/pipeline_reorg/ that legitimately hold no test matrix, so the
   # gate has nothing to prove for them. ttsim-skip-list.yaml is a per-arch mapping of
