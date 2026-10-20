@@ -142,6 +142,9 @@ class PrefillModelAdapter(ABC):
     # model declares no drafter of its own; DFLASH_HF_MODEL / PREFILL_DFLASH_GOLDEN_KV_DIR override.
     dflash_model_default: str = ""
     dflash_golden_default: str = ""
+    # Whether the runner may build the drafter with PREFILL_USE_TRACE=0. Off by default: DFlash is gated
+    # traced. A model whose trace serves one slot only turns it on for multi-user runs.
+    dflash_allows_eager: bool = False
     supports_mtp: bool = False
     supports_tp_shard_kv: bool = False
     tp_shard_kv_default: bool = False

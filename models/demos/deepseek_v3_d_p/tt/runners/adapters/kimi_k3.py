@@ -58,6 +58,8 @@ class KimiK3Adapter(MLAPrefillAdapter):
     # RadixArk's Kimi-K3-DSpark: a DFlash-style drafter (num_target_layers=93) tapping 7/23/51/67/83.
     # Its golden is keyed to prefill_trace_default's prompt, so the two move together.
     supports_dflash = True
+    # Traced K3 serves one KDA slot (TtKimiK3Transformer.set_trace_controller), so multi-user DSpark is eager.
+    dflash_allows_eager = True
     dflash_model_default = "/mnt/weka/model-weights/llm/moonshotai/Kimi-K3-DSpark"
     dflash_golden_default = (
         "/mnt/models/deepseek-prefill-cache/golden/structured_traces/k3_dspark_trace_55k/structured_kv"
