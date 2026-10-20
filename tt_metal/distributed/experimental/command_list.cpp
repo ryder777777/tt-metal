@@ -18,6 +18,7 @@
 #include <tt-metalium/math.hpp>
 #include <tt-metalium/experimental/metal2_host_api/tensor_spec_relaxations.hpp>
 #include <tt_stl/fmt.hpp>
+#include <tt-logger/tt-logger.hpp>
 
 #include "tt_metal/distributed/fd_mesh_command_queue.hpp"
 #include "tt_metal/distributed/mesh_coord_utils.hpp"
@@ -47,6 +48,8 @@ namespace tt::tt_metal::experimental {
 using namespace tt::tt_metal::distributed;
 
 namespace detail {
+
+using BoundTensorFootprint = ::tt::tt_metal::detail::BoundTensorFootprint;
 
 struct CommandListData {
     MeshCoordinateRange device_range = MeshCoordinateRange(MeshShape(0, 0));
@@ -150,6 +153,10 @@ struct CommandListParameterRegistry {
     // start in the stream, a multiple of window_size. Each value is window_size / sizeof(uint32_t) words.
     std::vector<std::unordered_map<uint32_t, std::vector<uint32_t>>> windows;
     uint32_t window_size = 0;
+    // DRAM footprint of every recorded (program, TensorParameter) binding. Empty when the tensor is not in DRAM.
+    std::vector<std::optional<BoundTensorFootprint>> tensor_regions;
+    // Indices into tensor_regions that each command-list tensor parameter patches.
+    std::unordered_map<CmdListTensorArgName, std::vector<size_t>> tensor_region_slots;
 };
 
 struct CommandListAssembly {
@@ -381,6 +388,9 @@ private:
     // program or a dummy GO signal, so these are the same for the whole mesh.
     DispatchArray<std::optional<TraceWorkerDescriptor>> worker_descriptors;
     std::vector<std::shared_ptr<MeshBuffer>> retained_binary_buffers;
+    // Become CommandListParameterRegistry::tensor_regions and tensor_region_slots at build().
+    std::vector<std::optional<BoundTensorFootprint>> tensor_regions;
+    std::unordered_map<CmdListTensorArgName, std::vector<size_t>> tensor_region_slots;
     bool valid = true;
     bool lock_held = false;
 };
@@ -400,13 +410,15 @@ public:
     ~Impl();
 
     void deallocate();
-    void replay(bool blocking) const;
+    void replay(bool blocking, bool check_dram_overlap) const;
     void update_args(const CmdListArgPatch& patch, bool blocking);
     MeshDevice& get_device() const;
     uint8_t get_cq_id() const;
 
 private:
     void validate() const;
+    // Fails if a live DRAM allocation overlaps a tensor region without exactly matching its address and size.
+    void verify_no_dram_overlap() const;
     void release_resources() noexcept;
 
     MeshDevice* mesh_device = nullptr;
@@ -475,8 +487,40 @@ void CommandList::Impl::deallocate() {
     release_resources();
 }
 
-void CommandList::Impl::replay(bool blocking) const {
+void CommandList::Impl::verify_no_dram_overlap() const {
+    const auto& allocator = mesh_device->allocator_impl();
+    for (const auto& region : registry.tensor_regions) {
+        if (!region.has_value() || region->size_per_bank == 0) {
+            continue;
+        }
+        const DeviceAddr end = region->address + region->size_per_bank;
+        const auto overlapping = allocator->get_dram_allocations_overlapping(region->address, end);
+        if (overlapping.empty()) {
+            continue;
+        }
+        const auto& [address, size] = overlapping.front();
+        TT_FATAL(
+            overlapping.size() == 1 && address == region->address && size == region->size_per_bank,
+            "Command-list DRAM range [{:#x}, {:#x}) overlaps a live allocation at [{:#x}, {:#x}) that does not "
+            "exactly match it",
+            region->address,
+            end,
+            address,
+            address + size);
+        log_debug(
+            tt::LogMetal,
+            "Command-list DRAM range [{:#x}, {:#x}) holds a live allocation of the same size, which replay will read "
+            "or overwrite",
+            region->address,
+            end);
+    }
+}
+
+void CommandList::Impl::replay(bool blocking, bool check_dram_overlap) const {
     validate();
+    if (check_dram_overlap) {
+        verify_no_dram_overlap();
+    }
     as_fd_queue(mesh_device->mesh_command_queue(bound_cq_id))
         .enqueue_command_list(
             descriptor.worker_descriptors(),
@@ -520,6 +564,7 @@ void CommandList::Impl::update_args(const CmdListArgPatch& patch, bool blocking)
         }
     }
     std::vector<uint32_t> tensor_words;
+    std::vector<std::pair<size_t, std::optional<detail::BoundTensorFootprint>>> staged_regions;
     for (const auto& [name, argument] : patch.tensor_args) {
         const auto it = registry.tensor_targets.find(name);
         TT_FATAL(it != registry.tensor_targets.end(), "Unknown command-list tensor parameter '{}'", *name);
@@ -538,6 +583,11 @@ void CommandList::Impl::update_args(const CmdListArgPatch& patch, bool blocking)
             TT_FATAL(tensor_words.size() == target.num_words, "Command-list tensor parameter '{}' changed size", *name);
             stage(target, tensor_words);
         }
+        const auto footprint = ::tt::tt_metal::detail::make_bound_tensor_footprint(tensor);
+        const auto region = footprint.buffer_type == BufferType::DRAM ? std::optional{footprint} : std::nullopt;
+        for (const size_t slot : registry.tensor_region_slots.at(name)) {
+            staged_regions.emplace_back(slot, region);
+        }
     }
 
     std::vector<MeshBufferPatch> patches;
@@ -549,6 +599,9 @@ void CommandList::Impl::update_args(const CmdListArgPatch& patch, bool blocking)
     as_fd_queue(cq).enqueue_command_list_patch(*command_buffer, patches);
     for (auto& [key, words] : staged_windows) {
         registry.windows[key.first][key.second] = std::move(words);
+    }
+    for (auto& [slot, region] : staged_regions) {
+        registry.tensor_regions[slot] = region;
     }
     if (blocking) {
         cq.finish();
@@ -987,6 +1040,28 @@ void CommandListBuilderImpl::add(MeshWorkload& workload, const CmdListParameters
     }
     resolve_parameters(staged_node, parameters);
 
+    std::vector<std::optional<BoundTensorFootprint>> new_regions;
+    std::map<std::pair<const ::tt::tt_metal::detail::ProgramImpl*, std::string>, size_t> region_slot_of;
+    for (auto& [device_range, program] : workload.get_programs()) {
+        const auto& program_impl = program.impl();
+        for (const auto& param_name : program_impl.get_registered_tensor_parameter_names()) {
+            const auto* footprint = program_impl.get_bound_tensor_footprint(param_name);
+            TT_FATAL(
+                footprint != nullptr,
+                "TensorParameter '{}' has no bound tensor. Call SetProgramRunArgs before recording the workload",
+                param_name);
+            region_slot_of.emplace(std::pair{&program_impl, param_name}, tensor_regions.size() + new_regions.size());
+            new_regions.push_back(
+                footprint->buffer_type == BufferType::DRAM ? std::optional{*footprint} : std::nullopt);
+        }
+    }
+    std::unordered_map<CmdListTensorArgName, std::vector<size_t>> new_region_slots;
+    for (const auto& [name, infos] : parameters.tensor_parameters) {
+        for (const auto& info : infos) {
+            new_region_slots[name].push_back(region_slot_of.at({&info.program.get().impl(), *info.param_name}));
+        }
+    }
+
     auto& worker = worker_descriptors[*staged_node.sub_device_id];
     if (!worker) {
         worker.emplace();
@@ -998,6 +1073,11 @@ void CommandListBuilderImpl::add(MeshWorkload& workload, const CmdListParameters
     staged_nodes.push_back(std::move(staged_node));
     if (binary_buffer) {
         retained_binary_buffers.push_back(std::move(binary_buffer));
+    }
+    tensor_regions.insert(tensor_regions.end(), new_regions.begin(), new_regions.end());
+    for (auto& [name, slots] : new_region_slots) {
+        auto& all_slots = tensor_region_slots[name];
+        all_slots.insert(all_slots.end(), slots.begin(), slots.end());
     }
 }
 
@@ -1011,6 +1091,8 @@ CommandList CommandListBuilderImpl::build(MeshCommandQueue& cq) const {
 
     (void)as_fd_queue(cq);
     auto assembly = assemble(cq, staged_nodes, worker_descriptors);
+    assembly.registry.tensor_regions = tensor_regions;
+    assembly.registry.tensor_region_slots = tensor_region_slots;
     auto command_buffer = allocate_and_commit(cq, assembly.descriptor, assembly.serialized_ranges);
     return CommandList(std::make_unique<CommandList::Impl>(
         mesh_device,
@@ -1032,12 +1114,16 @@ void CommandListBuilderImpl::clear() {
     staged_nodes.clear();
     worker_descriptors = {};
     retained_binary_buffers.clear();
+    tensor_regions.clear();
+    tensor_region_slots.clear();
 }
 
 void CommandListBuilderImpl::deallocate() {
     staged_nodes.clear();
     worker_descriptors = {};
     retained_binary_buffers.clear();
+    tensor_regions.clear();
+    tensor_region_slots.clear();
     valid = false;
     if (lock_held) {
         mesh_device.impl().release_command_list_builder();
@@ -1084,9 +1170,9 @@ CommandList::CommandList(CommandList&&) noexcept = default;
 CommandList& CommandList::operator=(CommandList&&) noexcept = default;
 CommandList::~CommandList() = default;
 
-void CommandList::replay(bool blocking) const {
+void CommandList::replay(bool blocking, bool check_dram_overlap) const {
     TT_FATAL(impl_ != nullptr, "CommandList has been moved from");
-    impl_->replay(blocking);
+    impl_->replay(blocking, check_dram_overlap);
 }
 
 void CommandList::update_args(const CmdListArgPatch& patch, bool blocking) {
@@ -1110,10 +1196,10 @@ void CommandList::deallocate() {
     }
 }
 
-void EnqueueCommandList(MeshCommandQueue& cq, CommandList& command_list, bool blocking) {
+void EnqueueCommandList(MeshCommandQueue& cq, CommandList& command_list, bool blocking, bool check_dram_overlap) {
     TT_FATAL(&command_list.device() == cq.device(), "CommandList belongs to a different MeshDevice");
     TT_FATAL(command_list.cq_id() == cq.id(), "CommandList was built for a different command queue");
-    command_list.replay(blocking);
+    command_list.replay(blocking, check_dram_overlap);
 }
 
 }  // namespace tt::tt_metal::experimental

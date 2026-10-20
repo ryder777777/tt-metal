@@ -238,14 +238,14 @@ TEST_F(CommandListTest, BuildsIndependentSnapshotsAndReplaysBlockingAndNonBlocki
     // The first snapshot contains only workload A.
     write_l1(mesh_device_, kAddressA, 0);
     write_l1(mesh_device_, kAddressB, 0);
-    EnqueueCommandList(cq, list_a, /*blocking=*/true);
+    EnqueueCommandList(cq, list_a, /*blocking=*/true, /*check_dram_overlap=*/false);
     EXPECT_EQ(read_l1(mesh_device_, kAddressA), kValueA);
     EXPECT_EQ(read_l1(mesh_device_, kAddressB), 0u);
 
     // The second snapshot contains both workloads and also supports non-blocking enqueue.
     write_l1(mesh_device_, kAddressA, 0);
     write_l1(mesh_device_, kAddressB, 0);
-    EnqueueCommandList(cq, list_ab, /*blocking=*/false);
+    EnqueueCommandList(cq, list_ab, /*blocking=*/false, /*check_dram_overlap=*/false);
     Finish(cq);
     EXPECT_EQ(read_l1(mesh_device_, kAddressA), kValueA);
     EXPECT_EQ(read_l1(mesh_device_, kAddressB), kValueB);
@@ -390,7 +390,7 @@ TEST_F(CommandListTest, UpdatesRuntimeAndCommonRuntimeArgumentsTransactionally) 
 
     write_l1(mesh_device_, kAddressA, 0);
     write_l1(mesh_device_, kAddressB, 0);
-    EnqueueCommandList(cq, command_list, /*blocking=*/true);
+    EnqueueCommandList(cq, command_list, /*blocking=*/true, /*check_dram_overlap=*/false);
     EXPECT_EQ(read_l1(mesh_device_, kAddressA), kValueA);
     EXPECT_EQ(read_l1(mesh_device_, kAddressB), 0u);
 
@@ -402,7 +402,7 @@ TEST_F(CommandListTest, UpdatesRuntimeAndCommonRuntimeArgumentsTransactionally) 
 
     write_l1(mesh_device_, kAddressA, 0);
     write_l1(mesh_device_, kAddressB, 0);
-    EnqueueCommandList(cq, command_list, /*blocking=*/true);
+    EnqueueCommandList(cq, command_list, /*blocking=*/true, /*check_dram_overlap=*/false);
     EXPECT_EQ(read_l1(mesh_device_, kAddressA), 0u);
     EXPECT_EQ(read_l1(mesh_device_, kAddressB), kValueB);
 }
@@ -496,7 +496,7 @@ TEST_F(CommandListTest, UpdatesTensorArgumentForSubsequentReplays) {
     ::tt::tt_metal::detail::WriteToBuffer(*output.mesh_buffer().get_reference_buffer(), zeros);
 
     // The initial replay copies input A to the output.
-    EnqueueCommandList(cq, command_list, /*blocking=*/true);
+    EnqueueCommandList(cq, command_list, /*blocking=*/true, /*check_dram_overlap=*/false);
     std::vector<uint32_t> result;
     ::tt::tt_metal::detail::ReadFromBuffer(*output.mesh_buffer().get_reference_buffer(), result);
     EXPECT_EQ(result, data_a);
@@ -517,7 +517,7 @@ TEST_F(CommandListTest, UpdatesTensorArgumentForSubsequentReplays) {
         .tensor_args = {{input_param, m2::ProgramRunArgs::TensorArgument{input_b}}},
     });
     ::tt::tt_metal::detail::WriteToBuffer(*output.mesh_buffer().get_reference_buffer(), zeros);
-    EnqueueCommandList(cq, command_list, /*blocking=*/true);
+    EnqueueCommandList(cq, command_list, /*blocking=*/true, /*check_dram_overlap=*/false);
     result.clear();
     ::tt::tt_metal::detail::ReadFromBuffer(*output.mesh_buffer().get_reference_buffer(), result);
     EXPECT_EQ(result, data_b);
@@ -596,7 +596,7 @@ void kernel_main() {
 
         write_l1(mesh_device_, kAddressA, 0);
         write_l1(mesh_device_, kAddressA + sizeof(uint32_t), 0);
-        EnqueueCommandList(cq, command_list, /*blocking=*/true);
+        EnqueueCommandList(cq, command_list, /*blocking=*/true, /*check_dram_overlap=*/false);
         EXPECT_EQ(read_l1(mesh_device_, kAddressA), patched.address()) << num_leading << " leading CRTAs";
         EXPECT_EQ(read_l1(mesh_device_, kAddressA + sizeof(uint32_t)), patched_page_size)
             << num_leading << " leading CRTAs";
@@ -656,7 +656,7 @@ void kernel_main() {
     for (uint32_t i = 0; i < crta_names.size(); ++i) {
         write_l1(mesh_device_, kAddressA + (i * sizeof(uint32_t)), 0);
     }
-    EnqueueCommandList(cq, command_list, /*blocking=*/true);
+    EnqueueCommandList(cq, command_list, /*blocking=*/true, /*check_dram_overlap=*/false);
     for (uint32_t i = 0; i < crta_names.size(); ++i) {
         EXPECT_EQ(read_l1(mesh_device_, kAddressA + (i * sizeof(uint32_t))), kValueA + i) << crta_names[i];
     }
@@ -721,7 +721,7 @@ TEST_F(CommandListTest, UpdatesEveryTargetOfAParameter) {
             ::tt::tt_metal::detail::WriteToDeviceL1(device(mesh_device_), node, address, zero);
         }
     }
-    EnqueueCommandList(cq, command_list, /*blocking=*/true);
+    EnqueueCommandList(cq, command_list, /*blocking=*/true, /*check_dram_overlap=*/false);
     for (const auto& node : {kNode, other_node}) {
         EXPECT_EQ(read_node(node, kAddressA), 0u) << node.str();
         EXPECT_EQ(read_node(node, kAddressB), kPatchedValue) << node.str();
@@ -759,7 +759,7 @@ TEST_F(CommandListTest, OrdersNonBlockingPatchesWithReplays) {
             .runtime_args = {{address_param, slots_address + (i * sizeof(uint32_t))}},
             .common_runtime_args = {{value_param, kValueA + i}},
         });
-        EnqueueCommandList(cq, command_list, /*blocking=*/false);
+        EnqueueCommandList(cq, command_list, /*blocking=*/false, /*check_dram_overlap=*/false);
     }
     Finish(cq);
 
@@ -782,7 +782,7 @@ TEST_F(CommandListMultiDeviceTest, ReplaysMeshWideWorkloadOnEveryDevice) {
     for (const auto& coord : all_devices) {
         write_l1(mesh_device_, coord, kAddressA, 0);
     }
-    EnqueueCommandList(cq, command_list, /*blocking=*/true);
+    EnqueueCommandList(cq, command_list, /*blocking=*/true, /*check_dram_overlap=*/false);
     for (const auto& coord : all_devices) {
         EXPECT_EQ(read_l1(mesh_device_, coord, kAddressA), kValueA) << "Device coordinate: " << coord;
     }
@@ -790,7 +790,7 @@ TEST_F(CommandListMultiDeviceTest, ReplaysMeshWideWorkloadOnEveryDevice) {
     for (const auto& coord : all_devices) {
         write_l1(mesh_device_, coord, kAddressA, 0);
     }
-    EnqueueCommandList(cq, command_list, /*blocking=*/false);
+    EnqueueCommandList(cq, command_list, /*blocking=*/false, /*check_dram_overlap=*/false);
     Finish(cq);
     for (const auto& coord : all_devices) {
         EXPECT_EQ(read_l1(mesh_device_, coord, kAddressA), kValueA) << "Device coordinate: " << coord;
@@ -833,7 +833,7 @@ TEST_F(CommandListMultiDeviceTest, ReplaysHeterogeneousAndNonConvexDeviceRanges)
         write_l1(mesh_device_, coord, kAddressB, 0);
         write_l1(mesh_device_, coord, kAddressC, 0);
     }
-    EnqueueCommandList(cq, command_list, /*blocking=*/true);
+    EnqueueCommandList(cq, command_list, /*blocking=*/true, /*check_dram_overlap=*/false);
 
     for (const auto& coord : all_devices) {
         EXPECT_EQ(read_l1(mesh_device_, coord, kAddressA), kValueA) << "Device coordinate: " << coord;
@@ -893,7 +893,7 @@ TEST_F(CommandListMultiDeviceTest, UpdatesParametersAcrossHeterogeneousDeviceRan
         write_l1(mesh_device_, coord, kAddressA, 0);
         write_l1(mesh_device_, coord, kAddressB, 0);
     }
-    EnqueueCommandList(cq, command_list, /*blocking=*/true);
+    EnqueueCommandList(cq, command_list, /*blocking=*/true, /*check_dram_overlap=*/false);
     for (const auto& coord : all_devices) {
         EXPECT_EQ(read_l1(mesh_device_, coord, kAddressA), 0u) << "Device coordinate: " << coord;
         EXPECT_EQ(read_l1(mesh_device_, coord, kAddressB), top_row.contains(coord) ? kTopRowValue : kValueB)
@@ -984,7 +984,7 @@ TEST_F(CommandListTest, AllowsTemporaryTensorLifetimeDuringBuild) {
     // remain usable until another allocation reuses or overwrites that storage; no live MeshTensor handle is required.
     auto& cq = mesh_device_->mesh_command_queue(0);
     auto command_list = builder.build(cq);
-    EnqueueCommandList(cq, command_list, /*blocking=*/true);
+    EnqueueCommandList(cq, command_list, /*blocking=*/true, /*check_dram_overlap=*/false);
 
     std::vector<uint32_t> result(total_bytes / sizeof(uint32_t));
     ::tt::tt_metal::enqueue_read_tensor(cq, output, reinterpret_cast<std::byte*>(result.data()));
@@ -1040,7 +1040,7 @@ TEST_F(CommandListTest, BuilderLifecyclePreservesBuiltLists) {
     // A built list owns its serialized commands and required kernel binaries, so it
     // remains replayable without its builder.
     write_l1(mesh_device_, kAddressA, 0);
-    EnqueueCommandList(cq, command_list, /*blocking=*/true);
+    EnqueueCommandList(cq, command_list, /*blocking=*/true, /*check_dram_overlap=*/false);
     EXPECT_EQ(read_l1(mesh_device_, kAddressA), kValueA);
 }
 
@@ -1054,21 +1054,24 @@ TEST_F(CommandListTest, CommandListMoveAndDeallocateInvalidateTheHandle) {
 
     CommandList moved_list(std::move(command_list));
     EXPECT_THAT(
-        [&] { EnqueueCommandList(cq, command_list, /*blocking=*/true); },  // NOLINT(bugprone-use-after-move)
+        [&] {
+            // NOLINTNEXTLINE(bugprone-use-after-move)
+            EnqueueCommandList(cq, command_list, /*blocking=*/true, /*check_dram_overlap=*/false);
+        },
         ThrowsMessage<std::runtime_error>(HasSubstr("CommandList has been moved from")));
     EXPECT_THAT(
         [&] { command_list.update_args({}); },  // NOLINT(bugprone-use-after-move)
         ThrowsMessage<std::runtime_error>(HasSubstr("CommandList has been moved from")));
 
     write_l1(mesh_device_, kAddressA, 0);
-    EnqueueCommandList(cq, moved_list, /*blocking=*/true);
+    EnqueueCommandList(cq, moved_list, /*blocking=*/true, /*check_dram_overlap=*/false);
     EXPECT_EQ(read_l1(mesh_device_, kAddressA), kValueA);
 
     // Explicit deallocation is idempotent and invalidates every remaining operation.
     moved_list.deallocate();
     moved_list.deallocate();
     EXPECT_THAT(
-        [&] { EnqueueCommandList(cq, moved_list, /*blocking=*/true); },
+        [&] { EnqueueCommandList(cq, moved_list, /*blocking=*/true, /*check_dram_overlap=*/false); },
         ThrowsMessage<std::runtime_error>(HasSubstr("CommandList has been deallocated")));
     EXPECT_THAT(
         [&] { (void)moved_list.device(); },
@@ -1267,32 +1270,32 @@ TEST_F(CommandListTest, ReplaysCommandListsUnderTheirRecordedSubDeviceLayouts) {
     // The second manager is still active, so the first list cannot replay until its
     // recorded manager is restored.
     EXPECT_THAT(
-        [&] { EnqueueCommandList(cq, list_a, /*blocking=*/true); },
+        [&] { EnqueueCommandList(cq, list_a, /*blocking=*/true, /*check_dram_overlap=*/false); },
         ThrowsMessage<std::runtime_error>(HasSubstr("active sub-device manager changed")));
 
     write_l1(mesh_device_, kAddressB, 0);
-    EnqueueCommandList(cq, list_b, /*blocking=*/true);
+    EnqueueCommandList(cq, list_b, /*blocking=*/true, /*check_dram_overlap=*/false);
     EXPECT_EQ(read_l1(mesh_device_, kAddressB), kValueB);
 
     mesh_device_->load_sub_device_manager(full_grid_manager);
     EXPECT_THAT(
-        [&] { EnqueueCommandList(cq, list_b, /*blocking=*/true); },
+        [&] { EnqueueCommandList(cq, list_b, /*blocking=*/true, /*check_dram_overlap=*/false); },
         ThrowsMessage<std::runtime_error>(HasSubstr("active sub-device manager changed")));
 
     write_l1(mesh_device_, kAddressA, 0);
-    EnqueueCommandList(cq, list_a, /*blocking=*/true);
+    EnqueueCommandList(cq, list_a, /*blocking=*/true, /*check_dram_overlap=*/false);
     EXPECT_EQ(read_l1(mesh_device_, kAddressA), kValueA);
 
     // Both lists remain live and can be alternated as long as the matching layout
     // is loaded before each replay.
     mesh_device_->load_sub_device_manager(single_core_manager);
     write_l1(mesh_device_, kAddressB, 0);
-    EnqueueCommandList(cq, list_b, /*blocking=*/true);
+    EnqueueCommandList(cq, list_b, /*blocking=*/true, /*check_dram_overlap=*/false);
     EXPECT_EQ(read_l1(mesh_device_, kAddressB), kValueB);
 
     mesh_device_->load_sub_device_manager(full_grid_manager);
     write_l1(mesh_device_, kAddressA, 0);
-    EnqueueCommandList(cq, list_a, /*blocking=*/true);
+    EnqueueCommandList(cq, list_a, /*blocking=*/true, /*check_dram_overlap=*/false);
     EXPECT_EQ(read_l1(mesh_device_, kAddressA), kValueA);
 }
 
@@ -1311,10 +1314,10 @@ TEST_F(CommandListMultiCQTest, EnforcesTheCommandQueueUsedAtBuildTime) {
 
     // The enqueue helper rejects a mismatched queue and accepts the bound queue.
     EXPECT_THAT(
-        [&] { EnqueueCommandList(cq1, list0, /*blocking=*/true); },
+        [&] { EnqueueCommandList(cq1, list0, /*blocking=*/true, /*check_dram_overlap=*/false); },
         ThrowsMessage<std::runtime_error>(HasSubstr("CommandList was built for a different command queue")));
     write_l1(mesh_device_, kAddressA, 0);
-    EXPECT_NO_THROW(EnqueueCommandList(cq1, list1, /*blocking=*/true));
+    EXPECT_NO_THROW(EnqueueCommandList(cq1, list1, /*blocking=*/true, /*check_dram_overlap=*/false));
     EXPECT_EQ(read_l1(mesh_device_, kAddressA), kValueA);
 }
 
@@ -1341,7 +1344,7 @@ TEST_F(CommandListTest, TracesAndCommandListsCanRunInSequenceButNotCoexist) {
             ThrowsMessage<std::runtime_error>(HasSubstr("while a CommandListBuilder or CommandList exists")));
 
         write_l1(mesh_device_, kAddressA, 0);
-        EnqueueCommandList(cq, second_list, /*blocking=*/true);
+        EnqueueCommandList(cq, second_list, /*blocking=*/true, /*check_dram_overlap=*/false);
         EXPECT_EQ(read_l1(mesh_device_, kAddressA), kValueA);
     }
 
@@ -1368,7 +1371,7 @@ TEST_F(CommandListTest, TracesAndCommandListsCanRunInSequenceButNotCoexist) {
     builder.add(list_workload);
     auto command_list = builder.build(cq);
     write_l1(mesh_device_, kAddressA, 0);
-    EnqueueCommandList(cq, command_list, /*blocking=*/true);
+    EnqueueCommandList(cq, command_list, /*blocking=*/true, /*check_dram_overlap=*/false);
     EXPECT_EQ(read_l1(mesh_device_, kAddressA), kValueA);
 }
 

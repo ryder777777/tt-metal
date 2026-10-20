@@ -5,9 +5,12 @@
 #pragma once
 
 #include <atomic>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include <tt-metalium/allocator.hpp>
 #include <tt-metalium/device.hpp>
@@ -78,6 +81,10 @@ public:
 
     std::unordered_set<Buffer*> get_allocated_buffers() const;
     size_t get_num_allocated_buffers() const;
+    // Live DRAM allocations overlapping the per-bank range [begin, end), as (address, aligned size per bank) pairs
+    // in address order.
+    std::vector<std::pair<DeviceAddr, DeviceAddr>> get_dram_allocations_overlapping(
+        DeviceAddr begin, DeviceAddr end) const;
 
     std::uint32_t get_num_banks(const BufferType& buffer_type) const;
     DeviceAddr get_bank_size(const BufferType& buffer_type) const;
@@ -197,6 +204,8 @@ private:
     std::unordered_map<std::uint32_t, CoreCoord> bank_id_to_logical_core_;
     std::unordered_map<BufferType, std::unordered_map<CoreCoord, std::vector<std::uint32_t>>> logical_core_to_bank_ids_;
     std::unordered_set<Buffer*> allocated_buffers_;
+    // Address -> aligned size per bank of every live DRAM allocation. DRAM allocations never overlap.
+    std::map<DeviceAddr, DeviceAddr> dram_allocations_;
 
     // HYBRID mode: device allocators to query per-bank ranges during lockstep allocation.
     std::vector<AllocatorImpl*> hybrid_device_allocators_;
