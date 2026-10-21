@@ -761,22 +761,9 @@ void AllocatorImpl::override_state(const AllocatorState& state) {
     }
     allocated_buffers_.clear();
     dram_allocations_.clear();
-    // Buffers from different source allocators may overlap. Merge them so dram_allocations_ stays disjoint.
-    for (const Buffer* buffer : state.get_all_allocated_buffers()) {
-        if (buffer->buffer_type() != BufferType::DRAM) {
-            continue;
-        }
-        DeviceAddr begin = buffer->address();
-        DeviceAddr end = begin + buffer->aligned_size_per_bank();
-        auto it = dram_allocations_.upper_bound(begin);
-        if (it != dram_allocations_.begin() && std::prev(it)->first + std::prev(it)->second > begin) {
-            --it;
-        }
-        while (it != dram_allocations_.end() && it->first < end) {
-            begin = std::min(begin, it->first);
-            end = std::max(end, it->first + it->second);
-            it = dram_allocations_.erase(it);
-        }
+    // The state's Buffer pointers may be stale, so rebuild from its regions. Regions are coalesced, so touching
+    // allocations become one entry.
+    for (const auto& [begin, end] : state.get_allocated_regions(BufferType::DRAM)) {
         dram_allocations_.emplace(begin, end - begin);
     }
 
