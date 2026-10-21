@@ -312,9 +312,6 @@ DeviceAddr AllocatorImpl::allocate_buffer(Buffer* buffer) {
         }
     }
     allocated_buffers_.insert(buffer);
-    if (buffer_type == BufferType::DRAM) {
-        dram_allocations_.emplace(address, buffer->aligned_size_per_bank());
-    }
     if (tracking_enabled_ && !unsafe_tracked_ids_by_manager_and_trace_.empty()) [[unlikely]] {
         this->record_allocation_if_unsafe(buffer);
     }
@@ -342,10 +339,7 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
     }
 
     switch (buffer_type) {
-        case BufferType::DRAM:
-            dram_manager_->deallocate_buffer(address);
-            dram_allocations_.erase(address);
-            break;
+        case BufferType::DRAM: dram_manager_->deallocate_buffer(address); break;
         case BufferType::L1: l1_manager_->deallocate_buffer(address); break;
         case BufferType::L1_SMALL: l1_small_manager_->deallocate_buffer(address); break;
         case BufferType::TRACE: trace_buffer_manager_->deallocate_buffer(address); break;
@@ -362,7 +356,6 @@ void AllocatorImpl::deallocate_buffer(Buffer* buffer) {
 void AllocatorImpl::deallocate_buffers() {
     std::lock_guard<std::mutex> lock(mutex_);
     dram_manager_->deallocate_all();
-    dram_allocations_.clear();
     l1_manager_->deallocate_all();
     l1_small_manager_->deallocate_all();
     trace_buffer_manager_->deallocate_all();
@@ -435,18 +428,9 @@ size_t AllocatorImpl::get_num_allocated_buffers() const {
     return allocated_buffers_.size();
 }
 
-std::vector<std::pair<DeviceAddr, DeviceAddr>> AllocatorImpl::get_dram_allocations_overlapping(
-    DeviceAddr begin, DeviceAddr end) const {
+std::vector<std::pair<DeviceAddr, DeviceAddr>> AllocatorImpl::get_dram_allocations() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<std::pair<DeviceAddr, DeviceAddr>> overlapping;
-    auto it = dram_allocations_.upper_bound(begin);
-    if (it != dram_allocations_.begin() && std::prev(it)->first + std::prev(it)->second > begin) {
-        --it;
-    }
-    for (; it != dram_allocations_.end() && it->first < end; ++it) {
-        overlapping.emplace_back(*it);
-    }
-    return overlapping;
+    return dram_manager_->get_allocated_ranges();
 }
 
 uint32_t AllocatorImpl::get_num_banks(const BufferType& buffer_type) const {
@@ -709,7 +693,6 @@ AllocatorImpl::~AllocatorImpl() {
         }
     }
     allocated_buffers_.clear();
-    dram_allocations_.clear();
 }
 
 AllocatorState AllocatorImpl::extract_state() const {
@@ -760,12 +743,6 @@ void AllocatorImpl::override_state(const AllocatorState& state) {
         this->record_all_deallocations();
     }
     allocated_buffers_.clear();
-    dram_allocations_.clear();
-    // The state's Buffer pointers may be stale, so rebuild from its regions. Regions are coalesced, so touching
-    // allocations become one entry.
-    for (const auto& [begin, end] : state.get_allocated_regions(BufferType::DRAM)) {
-        dram_allocations_.emplace(begin, end - begin);
-    }
 
     // Apply state for each buffer type
     for (const auto& [buffer_type, type_state] : state.get_states_per_buffer_type()) {

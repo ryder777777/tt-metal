@@ -223,7 +223,12 @@ private:
  *                              exactly one allocation occupies it with the same address and size; replay then reads
  *                              or overwrites that allocation, whichever tensor it belongs to. Any other overlap
  *                              fails and nothing is enqueued. Ranges are not reserved between replays.
+ *
+ *                              The check is for evaluation only, not for live runs. Use it while developing to confirm
+ *                              that replays only touch free or exactly matching DRAM, then leave it off in production:
+ *                              every checked replay scans all live DRAM allocations on the host.
  */
-void EnqueueCommandList(MeshCommandQueue& cq, CommandList& command_list, bool blocking, bool check_dram_overlap);
+void EnqueueCommandList(
+    MeshCommandQueue& cq, CommandList& command_list, bool blocking, bool check_dram_overlap = false);
 
 }  // namespace tt::tt_metal::experimental

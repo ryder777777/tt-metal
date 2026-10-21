@@ -46,6 +46,7 @@ using m2::test_helpers::BindTensorParameterToKernel;
 using m2::test_helpers::MakeMinimalDFB;
 using m2::test_helpers::MakeMinimalGen1DMKernel;
 using m2::test_helpers::MakeMinimalWorkUnit;
+using ::testing::Contains;
 using ::testing::HasSubstr;
 using ::testing::ThrowsMessage;
 
@@ -954,11 +955,10 @@ TEST_F(CommandListMultiDeviceTest, SynchronizedAllocatorMergesOverlappingDramAll
     ::tt::tt_metal::experimental::synchronize_allocator_state(
         mesh_device_->allocator().get(), {sub0->allocator().get(), sub1->allocator().get()});
 
-    // X, the pad, and Y merge into the single entry [0-6).
-    const auto overlapping =
-        mesh_device_->allocator_impl()->get_dram_allocations_overlapping(base, base + (6 * kPageSize));
-    const std::vector<std::pair<DeviceAddr, DeviceAddr>> expected{{base, 6 * kPageSize}};
-    EXPECT_EQ(overlapping, expected);
+    // X, the pad, and Y merge into the single allocation [0-6). Allocations are disjoint, so no other one overlaps it.
+    EXPECT_THAT(
+        mesh_device_->allocator_impl()->get_dram_allocations(),
+        Contains(std::pair<DeviceAddr, DeviceAddr>{base, base + (6 * kPageSize)}));
 }
 
 TEST_F(CommandListTest, AllowsTemporaryTensorLifetimeDuringBuild) {
@@ -1013,15 +1013,15 @@ TEST_F(CommandListTest, CheckedReplayAcceptsOnlyFreeOrExactRanges) {
     // any other overlap. One command list is built over a fixed layout of DRAM slots; each overlap shape is then made
     // by freeing slots and allocating into the hole.
     //
-    // Placement is predictable because DRAM allocates bottom-up with best fit: an allocation lands at the start of the
-    // smallest hole that fits it. Every address the test relies on is asserted, so a change in placement fails loudly
+    // Placement is predictable because DRAM allocates bottom-up with first fit: an allocation lands at the start of the
+    // lowest hole that fits it. Every address the test relies on is asserted, so a change in placement fails loudly
     // instead of quietly testing a different shape.
     const auto input_spec = dram_tensor_spec(4 * mesh_device_->allocator()->get_num_banks(BufferType::DRAM));
     auto& cq = mesh_device_->mesh_command_queue(0);
 
     // Layout, in pages per bank from P0:  [P0 0-2][T 2-6][P1 6-8][fence 8-10]
     // T is the recorded input, and P0 and P1 touch it on both sides. The fence is never freed, so a hole that includes
-    // P1 stays bounded instead of merging with the free space above it, which keeps the hole the best fit.
+    // P1 stays bounded instead of merging with the free space above it, which keeps every hole's size exact.
     MeshTensor output = MeshTensor::allocate_on_device(*mesh_device_, input_spec);
     auto p0 = allocate_dram(*mesh_device_, 2);
     std::optional<MeshTensor> t = MeshTensor::allocate_on_device(*mesh_device_, input_spec);
